@@ -1,0 +1,120 @@
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+#include <BLEClient.h>
+#include <BLECharacteristic.h>
+
+bool deviceConnected = false;
+bool deviceFound = false;
+bool isLocked = true; // Added variable to keep track of lock state
+BLEAddress *serverAddress;
+BLEClient *pClient;
+
+static BLEUUID serviceUUID(BLEUUID((uint16_t)0x1812)); // Human Interface Device
+static BLEUUID charUUID(BLEUUID((uint16_t)0x2A4D)); // HID Report characteristic
+
+// Callbacks for client connection
+class MyClientCallback : public BLEClientCallbacks {
+  void onConnect(BLEClient* pclient) {
+    deviceConnected = true;
+    Serial.println("Connected to the server.");
+  }
+
+  void onDisconnect(BLEClient* pclient) {
+    deviceConnected = false;
+    Serial.println("Disconnected from the server.");
+  }
+};
+
+// Callbacks for detected BLE devices
+class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice advertisedDevice) {
+    Serial.print("Device found: ");
+    Serial.println(advertisedDevice.toString().c_str());
+    if (advertisedDevice.haveServiceUUID() && advertisedDevice.getServiceUUID().equals(serviceUUID)) {
+      advertisedDevice.getScan()->stop();
+      serverAddress = new BLEAddress(advertisedDevice.getAddress());
+      deviceFound = true;
+      Serial.println("Device found with HID service.");
+    }
+  }
+};
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Starting ESP32 BLE Client application...");
+
+  BLEDevice::init("");
+
+  // Start scanning for devices
+  BLEScan *pBLEScan = BLEDevice::getScan();
+  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  pBLEScan->setActiveScan(true);
+  pBLEScan->start(5);
+}
+
+void loop() {
+  if (deviceFound && !deviceConnected) {
+    // Connect to the remote BLE Server.
+    deviceFound = false; // reset for next connection attempt
+    pClient = BLEDevice::createClient();
+    pClient->setClientCallbacks(new MyClientCallback());
+    pClient->connect(*serverAddress);
+    
+    // Obtain a reference to the service we are after in the remote BLE server.
+    BLERemoteService *pRemoteService = pClient->getService(serviceUUID);
+    if (pRemoteService != nullptr) {
+      // Obtain a reference to the characteristic in the service of the remote BLE server.
+      BLERemoteCharacteristic *pRemoteCharacteristic = pRemoteService->getCharacteristic(charUUID);
+      if (pRemoteCharacteristic != nullptr) {
+        // Subscribe to the characteristic
+        if (pRemoteCharacteristic->canNotify()) {
+          pRemoteCharacteristic->registerForNotify([](BLERemoteCharacteristic *pBLERemoteCharacteristic, uint8_t *pData, size_t length, bool isNotify) {
+            Serial.print("Notification: ");
+            for (int i = 0; i < length; i++) {
+              
+              Serial.print(pData[i], HEX);
+              Serial.print(" ");
+            }
+            Serial.println();
+            // Check if the notification data matches the condition for lock/unlock
+            if (length > 0 && pData[0] == 0) { // Assuming the condition "Notification: 0"
+              if (isLocked) {
+
+                
+                isLocked = false; // Unlock
+                Serial.println("Hi"); // Print "Hi" upon unlocking
+
+
+
+
+                
+              } else {
+                isLocked = true; // Lock
+                Serial.println("Hello"); // Print "Hello" upon locking
+
+
+
+                
+              }
+            }
+          });
+        }
+      } else {
+        Serial.println("Failed to find HID characteristic.");
+      }
+    } else {
+      Serial.println("Failed to find HID service.");
+    }
+  }
+
+  delay(1000);
+//
+//  if (serverAddress != nullptr) { // Check if there's a targeted device address
+//    Serial.print("Target device address: ");
+//    Serial.println(serverAddress->toString().c_str());
+//  } else {
+//    Serial.println("No target device address available.");
+//  }
+}
