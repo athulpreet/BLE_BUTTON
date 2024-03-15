@@ -1,0 +1,450 @@
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+#include <BLEClient.h>
+#include <BLECharacteristic.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <ESP.h>
+
+
+#include <EEPROM.h>
+
+#define EEPROM_SIZE 64
+
+
+
+//*******************************************************************************
+
+#define OLED_SDA 17
+#define OLED_SCL 18
+
+#define BUTTON_PIN 12
+#define MENU_BUTTON_PIN 13
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+
+#define TIMEOUT_DURATION 5000
+
+
+
+
+
+volatile unsigned long lastMenuButtonDebounceTime = 0; // Initialize debounce time for the menu button
+unsigned long belowThresholdStartTime = 0; // Global variable to track when the reading goes below 0.2 kg
+
+volatile bool buttonPressed = false;
+volatile bool menuButtonPressed = false;
+volatile unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 300;
+
+
+int value=20;
+int setvalue=20;
+
+volatile bool buttonPressDetected = false;
+volatile unsigned long pressStartTime = 0;
+volatile bool buttonShortPress = false;
+volatile bool buttonLongPress = false;
+volatile unsigned long buttonPressTime = 0;
+const unsigned long longPressThreshold = 3000; // Threshold for long press, e.g., 1000 milliseconds
+
+
+unsigned long lastButtonPressTimes = millis(); // Initialize last button press time
+const unsigned long timeouts = 2000; // 2 seconds timeout in milliseconds
+
+
+volatile bool longPressTriggered = false;
+
+//const unsigned long longPressThreshold = 1000; // Adjust as necessary for long press detection
+
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+
+
+void IRAM_ATTR handleButtonPress() {
+    if (digitalRead(BUTTON_PIN) == LOW) { // Button is pressed
+        if (!buttonPressDetected) { // If a new press is detected
+            pressStartTime = millis(); // Record press start time
+            buttonPressDetected = true;
+        }
+    } else { // Button is released
+        buttonPressDetected = false;
+        if (!buttonLongPress) { // If a long press has not occurred
+            buttonShortPress = true; // It's a short press (since button is now released)
+        }
+        // Reset the long press flag upon release
+        buttonLongPress = false;
+    }
+}
+
+
+
+
+void IRAM_ATTR handleMenuButtonPress() {
+    unsigned long currentTime = millis();
+    if ((currentTime - lastMenuButtonDebounceTime) > debounceDelay) {
+        menuButtonPressed = true;
+        belowThresholdStartTime = 0;
+        lastMenuButtonDebounceTime = currentTime;
+        
+    }
+}
+
+
+
+//*******************************************************************************
+
+
+
+
+
+
+
+
+
+bool deviceConnected = false;
+bool deviceFound = false;
+bool isLocked = true; // Added variable to keep track of lock state
+BLEAddress *serverAddress;
+BLEClient *pClient;
+
+static BLEUUID serviceUUID(BLEUUID((uint16_t)0x1812)); // Human Interface Device
+static BLEUUID charUUID(BLEUUID((uint16_t)0x2A4D)); // HID Report characteristic
+
+// Callbacks for client connection
+class MyClientCallback : public BLEClientCallbacks {
+  void onConnect(BLEClient* pclient) {
+    deviceConnected = true;
+     displayCenteredText("CONNECTED");
+    //Serial.println("Connected to the server.");
+  }
+
+  void onDisconnect(BLEClient* pclient) {
+    deviceConnected = false;
+   // Serial.println("Disconnected from the server.");
+  }
+};
+
+// Callbacks for detected BLE devices
+class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice advertisedDevice) {
+    //Serial.print("Device found: ");
+    //Serial.println(advertisedDevice.toString().c_str());
+    if (advertisedDevice.haveServiceUUID() && advertisedDevice.getServiceUUID().equals(serviceUUID)) {
+      advertisedDevice.getScan()->stop();
+      serverAddress = new BLEAddress(advertisedDevice.getAddress());
+      deviceFound = true;
+     // Serial.println("Device found with HID service.");
+    }
+  }
+};
+
+void setup() {
+  Serial.begin(9600);
+
+
+
+
+
+ if (!EEPROM.begin(EEPROM_SIZE)) {
+   // Serial.println("Failed to initialise EEPROM");
+    return;
+  }
+value = readData(0);
+
+
+Wire.begin(OLED_SDA, OLED_SCL);
+  
+    pinMode(BUTTON_PIN, INPUT);
+    attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButtonPress, CHANGE);
+
+
+    pinMode(MENU_BUTTON_PIN, INPUT);
+    attachInterrupt(digitalPinToInterrupt(MENU_BUTTON_PIN), handleMenuButtonPress, RISING);
+
+
+    
+ if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+       // Serial.println(F("SSD1306 allocation failed"));
+        for (;;);
+    }
+   
+    displayCenteredText("THINTURE");
+
+
+
+  
+  //Serial.println("Starting ESP32 BLE Client application...");
+
+  BLEDevice::init("");
+
+  // Start scanning for devices
+  BLEScan *pBLEScan = BLEDevice::getScan();
+  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  pBLEScan->setActiveScan(true);
+  pBLEScan->start(5);
+}
+
+void loop() {
+  if (deviceFound && !deviceConnected) {
+    // Connect to the remote BLE Server.
+    deviceFound = false; // reset for next connection attempt
+    pClient = BLEDevice::createClient();
+    pClient->setClientCallbacks(new MyClientCallback());
+    pClient->connect(*serverAddress);
+    
+    // Obtain a reference to the service we are after in the remote BLE server.
+    BLERemoteService *pRemoteService = pClient->getService(serviceUUID);
+    if (pRemoteService != nullptr) {
+      // Obtain a reference to the characteristic in the service of the remote BLE server.
+      BLERemoteCharacteristic *pRemoteCharacteristic = pRemoteService->getCharacteristic(charUUID);
+      if (pRemoteCharacteristic != nullptr) {
+        // Subscribe to the characteristic
+        if (pRemoteCharacteristic->canNotify()) {
+          pRemoteCharacteristic->registerForNotify([](BLERemoteCharacteristic *pBLERemoteCharacteristic, uint8_t *pData, size_t length, bool isNotify) {
+           // Serial.print("Notification: ");
+            for (int i = 0; i < length; i++) {
+              
+              //Serial.print(pData[i], HEX);
+              //Serial.print(" ");
+            }
+            //Serial.println();
+            // Check if the notification data matches the condition for lock/unlock
+            if (length > 0 && pData[0] == 0) { // Assuming the condition "Notification: 0"
+              if (isLocked) {
+
+                
+                isLocked = false; // Unlock
+                //Serial.println("Hi"); // Print "Hi" upon unlocking
+
+displayCenteredText("UNLOCKED");
+
+
+                
+              } else {
+                isLocked = true; // Lock
+               // Serial.println("Hello"); // Print "Hello" upon locking
+
+
+displayCenteredText("LOCKED");
+                
+              }
+            }
+          });
+        }
+      } else {
+      //  Serial.println("Failed to find HID characteristic.");
+      }
+    } else {
+     // Serial.println("Failed to find HID service.");
+    }
+  }
+//************************************************************************************************
+
+if(!(isLocked)){
+
+
+
+if (buttonShortPress==1) {
+
+value=value+10;
+
+ //saveData(0, value);
+if(value>140)
+{
+  value=20;
+  }
+ displayWeight(value);
+  buttonShortPress = false; // Reset the flag
+  
+  }
+
+  if (buttonPressDetected && !buttonLongPress) {
+        if (millis() - pressStartTime >= longPressThreshold) {
+            buttonLongPress = true; // Long press detected
+            buttonShortPress = false; // Prevent triggering a short press action later
+            
+            // Handle long press action here
+            displayCenteredText("SET SPEED");
+            delay(2000);
+             lastButtonPressTimes = millis();
+unsigned long startTime = millis(); // To track total time in the loop
+setvalue = readData(0);
+
+while (true) { // Now effectively using the condition inside the loop for control
+
+  if (millis() - startTime <= 5000) { // Stay in loop for up to 5 seconds since last reset
+
+    if (buttonShortPress == 1) {
+      startTime = millis(); // Reset timer because of button press
+      setvalue = setvalue + 10;
+      
+      if (setvalue > 140) {
+        setvalue = 20;
+      }
+      displayset(setvalue);
+      buttonShortPress = false; // Reset the flag
+    }
+
+    if (menuButtonPressed) {
+      startTime = millis(); // Reset timer because of button press
+      setvalue = setvalue - 10;
+     
+      if (setvalue < 20) {
+        setvalue = 140;
+      }
+      displayset(setvalue);
+      menuButtonPressed = false;
+    }
+
+    delay(10); // Small delay to prevent running too fast
+
+  } else {
+    saveData(0, setvalue);
+    displayCenteredText("DONE");
+    break; // Exit the loop if 5 seconds have passed without button presses
+  }
+}
+
+
+
+            
+        }
+        
+    }
+
+
+ if (menuButtonPressed) {
+
+value=value-10;
+//saveData(0, value);
+if(value<20)
+{
+  value=140;
+  }
+
+ displayWeight(value);
+   menuButtonPressed = false;
+  
+  
+  }
+
+
+ Serial.print((char)value);
+
+}
+//************************************************************************************************
+  delay(1000);
+//
+//  if (serverAddress != nullptr) { // Check if there's a targeted device address
+//    Serial.print("Target device address: ");
+//    Serial.println(serverAddress->toString().c_str());
+//  } else {
+//    Serial.println("No target device address available.");
+//  }
+}
+
+
+
+
+
+
+
+
+void displayCenteredText(String message) {
+    display.clearDisplay(); // Clear the display
+
+    // Set text size and color
+    display.setTextSize(2); // Increase the text size
+    display.setTextColor(SSD1306_WHITE); // Set text color to white
+
+    // Calculate width and height of the text to center it
+    int16_t x1, y1;
+    uint16_t w, h;
+    display.getTextBounds(message, 0, 0, &x1, &y1, &w, &h); // Calculate the width and height of the text
+    int x = (SCREEN_WIDTH - w) / 2; // Calculate x position to center the text
+    int y = (SCREEN_HEIGHT - h) / 2; // Calculate y position to center the text
+
+    // Set cursor to calculated position
+    display.setCursor(x, y);
+
+    // Print the message
+    display.println(message);
+
+    // Optionally add some graphics
+    display.drawRoundRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, 5, SSD1306_WHITE); // Draw a rounded rectangle around the screen
+    // Add more graphics here if desired
+
+    // Update the display with all of the above
+    display.display();
+}
+
+
+
+
+
+
+
+
+
+void displayWeight(int weight) {
+  display.clearDisplay();
+  display.setTextSize(3);
+  int16_t x, y;
+  uint16_t w, h;
+  String displayText = String(weight);
+  display.getTextBounds(displayText, 0, 0, &x, &y, &w, &h);
+  int centerX = (SCREEN_WIDTH - w) / 2;
+  int centerY = (SCREEN_HEIGHT - h) / 2;
+  display.drawRoundRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, 5, SSD1306_WHITE);
+  display.setCursor(centerX, centerY);
+  display.println(displayText);
+  //  display.print("S"+ displayText);
+  display.display();
+}
+
+
+void displayset(int weight) {
+  display.clearDisplay();
+  display.setTextSize(2);
+  int16_t x, y;
+  uint16_t w, h;
+  String displayText = String(weight);
+  display.getTextBounds(displayText, 0, 0, &x, &y, &w, &h);
+  int centerX = ((SCREEN_WIDTH - w) / 2)-10;
+  int centerY = (SCREEN_HEIGHT - h) / 2;
+  display.drawRoundRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, 5, SSD1306_WHITE);
+  display.setCursor(centerX, centerY);
+  display.setTextColor(SSD1306_WHITE);
+  display.print("S :"+ displayText);
+  display.display();
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+void saveData(int address, byte value) {
+  EEPROM.write(address, value);
+  EEPROM.commit();
+}
+
+byte readData(int address) {
+  return EEPROM.read(address);
+}
